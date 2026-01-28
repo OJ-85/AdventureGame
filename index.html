@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sunstone of Eldermere</title>
+<style>
+  body { background:#111; color:#ddd; font-family: monospace; margin:0; display:flex; flex-direction:column; align-items:center; }
+  #game { display:flex; gap:16px; margin-top:16px; }
+  #screen { border:4px solid #444; image-rendering: pixelated; width:640px; height:400px; }
+  #ui { width:360px; }
+  #transcript { background:#000; color:#0f0; height:360px; overflow-y:auto; padding:8px; border:2px solid #444; }
+  #input { width:100%; padding:8px; margin-top:8px; background:#111; color:#fff; border:2px solid #444; }
+  #status { margin-top:8px; font-size:14px; color:#aaa; }
+  .line { margin:0 0 4px 0; }
+</style>
+</head>
+<body>
+<!--
+Design Doc:
+Rooms:
+1) Village Gate - start point with guard blocking north.
+2) Market - coin pickup and town flavor.
+3) Tavern - talk to barkeep for lantern.
+4) Alley - rope pickup.
+5) Forest Edge - hermit NPC and locket side-goal.
+6) Old Tower Base - trapdoor down, stairs up.
+7) Tower Top - chest with Sunstone.
+8) Cellar - dark area hiding key.
+
+Items:
+- coin (Market)
+- lantern (Tavern, given by barkeep)
+- rope (Alley)
+- key (Cellar, revealed when lantern lit)
+- sunstone (Tower Top, inside chest)
+- locket (Forest Edge)
+
+Puzzles:
+- Bribe guard with coin (clue from guard dialogue).
+- Obtain lantern from barkeep (clue from barkeep dialogue).
+- Place rope to access cellar (clue from trapdoor description).
+- Light lantern to see key in cellar (clue from darkness message).
+- Unlock chest with key to claim Sunstone (clue on chest).
+- Return locket to hermit for side-goal (clue from hermit).
+
+Critical Flags:
+- guardBribed
+- lanternLit
+- ropePlaced
+- chestOpened
+- locketReturned
+-->
+<canvas id="screen" width="320" height="200"></canvas>
+<div id="game">
+  <div id="ui">
+    <div id="transcript"></div>
+    <input id="input" placeholder="Type a command..." autocomplete="off" />
+    <div id="status"></div>
+  </div>
+</div>
+<!--
+Self-check:
+Walkthrough:
+1) LOOK
+2) GO EAST (Market), TAKE COIN
+3) GO WEST, GO WEST (Tavern), TALK BARKEEP, TAKE LANTERN
+4) GO EAST, GO SOUTH (Alley), TAKE ROPE
+5) GO NORTH, GO NORTH (Gate), GIVE COIN TO GUARD
+6) GO NORTH (Forest Edge), TAKE LOCKET, TALK HERMIT (learn about tower)
+7) GO NORTH (Tower Base), USE ROPE
+8) GO DOWN (Cellar), LIGHT LANTERN, TAKE KEY
+9) GO UP, GO UP (Tower Top), OPEN CHEST
+10) GO DOWN, GO SOUTH, TALK HERMIT (return locket optional)
+
+Parser tests:
+- HELP
+- LOOK AT GATE
+- INVENTORY
+- TAKE COIN
+- GIVE COIN TO GUARD
+- TALK TO BARKEEP
+- USE ROPE ON TRAPDOOR
+- LIGHT LANTERN
+- OPEN CHEST
+- GO NORTH
+-->
+<script>
+const palette = [
+  "#000000", "#0000AA", "#00AA00", "#00AAAA",
+  "#AA0000", "#AA00AA", "#AA5500", "#AAAAAA",
+  "#555555", "#5555FF", "#55FF55", "#55FFFF",
+  "#FF5555", "#FF55FF", "#FFFF55", "#FFFFFF"
+];
+
+const rooms = {
+  gate: { name: "Village Gate", exits: { east: "market", west: "tavern", south: "alley", north: "forest" }, guard: true },
+  market: { name: "Market", exits: { west: "gate" } },
+  tavern: { name: "Tavern", exits: { east: "gate" } },
+  alley: { name: "Alley", exits: { north: "gate" } },
+  forest: { name: "Forest Edge", exits: { south: "gate", north: "tower" } },
+  tower: { name: "Old Tower Base", exits: { south: "forest", up: "towerTop" , down: "cellar" } },
+  towerTop: { name: "Tower Top", exits: { down: "tower" } },
+  cellar: { name: "Cellar", exits: { up: "tower" } }
+};
+
+const items = {
+  coin: { name: "coin", aliases: ["coin", "gold"], location: "market", takeable: true, desc: "A stamped brass coin." },
+  lantern: { name: "lantern", aliases: ["lantern", "lamp"], location: "hidden", takeable: true, desc: "An oil lantern." },
+  rope: { name: "rope", aliases: ["rope", "coil"], location: "alley", takeable: true, desc: "A sturdy rope." },
+  key: { name: "key", aliases: ["key", "iron"], location: "hidden", takeable: true, desc: "A cold iron key." },
+  sunstone: { name: "sunstone", aliases: ["sunstone", "gem", "stone"], location: "hidden", takeable: true, desc: "A glowing amber gem." },
+  locket: { name: "locket", aliases: ["locket", "pendant"], location: "forest", takeable: true, desc: "A silver locket etched with leaves." }
+};
+
+const npcs = {
+  guard: { name: "guard", room: "gate", desc: "A vigilant guard in a battered helm." },
+  barkeep: { name: "barkeep", room: "tavern", desc: "A barkeep with tired eyes and a kind smile." },
+  hermit: { name: "hermit", room: "forest", desc: "A forest hermit wrapped in mossy cloaks." }
+};
+
+const hints = [
+  { id: "guard", check: s => s.flags.guardBribed, steps: [
+    "The guard looks bored; maybe coin can loosen his rules.",
+    "Find some money in town and offer it to the guard.",
+    "Try: GIVE COIN TO GUARD at the gate."
+  ]},
+  { id: "lantern", check: s => s.items.lantern.location === "inventory", steps: [
+    "The tower cellar is dark; you will need a light.",
+    "The barkeep knows about spare gear.",
+    "Try: TALK BARKEEP in the tavern."
+  ]},
+  { id: "rope", check: s => s.flags.ropePlaced, steps: [
+    "The trapdoor looks deep; you might need a way down.",
+    "There is a rope somewhere in town.",
+    "Try: USE ROPE in the tower base."
+  ]},
+  { id: "key", check: s => s.items.key.location === "inventory", steps: [
+    "The cellar is too dark to see.",
+    "Light the lantern before searching.",
+    "Try: LIGHT LANTERN in the cellar."
+  ]},
+  { id: "chest", check: s => s.flags.chestOpened, steps: [
+    "The chest is locked and needs a key.",
+    "The key is hidden in the cellar.",
+    "Try: OPEN CHEST when you have the key."
+  ]},
+  { id: "locket", check: s => s.flags.locketReturned, steps: [
+    "The hermit mentioned a lost keepsake.",
+    "The locket lies near the forest edge.",
+    "Try: GIVE LOCKET TO HERMIT."
+  ]}
+];
+
+let state = null;
+let pendingDisambig = null;
+
+function newState() {
+  return {
+    room: "gate",
+    items: JSON.parse(JSON.stringify(items)),
+    flags: { guardBribed: false, lanternLit: false, ropePlaced: false, chestOpened: false, locketReturned: false },
+    transcript: [],
+    history: [],
+    hintIndex: {}
+  };
+}
+
+const transcriptEl = document.getElementById("transcript");
+const inputEl = document.getElementById("input");
+const statusEl = document.getElementById("status");
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+
+function addLine(text) {
+  state.transcript.push(text);
+  const p = document.createElement("div");
+  p.className = "line";
+  p.textContent = text;
+  transcriptEl.appendChild(p);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function setStatus() {
+  const inv = Object.values(state.items).filter(i => i.location === "inventory").map(i => i.name).join(", ") || "(empty)";
+  statusEl.textContent = `Location: ${rooms[state.room].name} | Inventory: ${inv}`;
+}
+
+function cloneState(s) {
+  return JSON.parse(JSON.stringify(s));
+}
+
+function saveHistory() {
+  state.history.push(cloneState(state));
+  if (state.history.length > 20) state.history.shift();
+}
+
+function restoreState(s) {
+  state = s;
+  transcriptEl.innerHTML = "";
+  state.transcript.forEach(line => {
+    const p = document.createElement("div");
+    p.className = "line";
+    p.textContent = line;
+    transcriptEl.appendChild(p);
+  });
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  drawRoom();
+  setStatus();
+}
+
+function drawRoom() {
+  ctx.fillStyle = palette[1];
+  ctx.fillRect(0,0,320,200);
+  const room = state.room;
+  if (room === "gate") drawGate();
+  if (room === "market") drawMarket();
+  if (room === "tavern") drawTavern();
+  if (room === "alley") drawAlley();
+  if (room === "forest") drawForest();
+  if (room === "tower") drawTower();
+  if (room === "towerTop") drawTowerTop();
+  if (room === "cellar") drawCellar();
+}
+
+function drawGate() {
+  ctx.fillStyle = palette[6];
+  ctx.fillRect(0,120,320,80);
+  ctx.fillStyle = palette[8];
+  ctx.fillRect(140,60,40,80);
+  ctx.fillStyle = palette[7];
+  ctx.fillRect(120,40,80,30);
+  ctx.fillStyle = palette[4];
+  if (!state.flags.guardBribed) ctx.fillRect(200,90,20,40);
+}
+
+function drawMarket() {
+  ctx.fillStyle = palette[6];
+  ctx.fillRect(0,120,320,80);
+  ctx.fillStyle = palette[14];
+  ctx.fillRect(40,80,60,40);
+  ctx.fillRect(120,70,70,50);
+  ctx.fillStyle = palette[12];
+  ctx.fillRect(200,90,60,30);
+}
+
+function drawTavern() {
+  ctx.fillStyle = palette[5];
+  ctx.fillRect(0,0,320,200);
+  ctx.fillStyle = palette[6];
+  ctx.fillRect(0,140,320,60);
+  ctx.fillStyle = palette[14];
+  ctx.fillRect(30,110,120,20);
+  ctx.fillStyle = palette[4];
+  ctx.fillRect(200,100,30,40);
+}
+
+function drawAlley() {
+  ctx.fillStyle = palette[8];
+  ctx.fillRect(0,0,320,200);
+  ctx.fillStyle = palette[6];
+  ctx.fillRect(0,150,320,50);
+  ctx.fillStyle = palette[4];
+  ctx.fillRect(60,120,40,30);
+}
+
+function drawForest() {
+  ctx.fillStyle = palette[2];
+  ctx.fillRect(0,0,320,200);
+  ctx.fillStyle = palette[6];
+  ctx.fillRect(0,150,320,50);
+  ctx.fillStyle = palette[10];
+  ctx.fillRect(40,90,40,60);
+  ctx.fillRect(100,70,50,80);
+  ctx.fillStyle = palette[4];
+  ctx.fillRect(220,110,20,40);
+}
+
+function drawTower() {
+  ctx.fillStyle = palette[1];
+  ctx.fillRect(0,0,320,200);
+  ctx.fillStyle = palette[7];
+  ctx.fillRect(110,30,100,140);
+  ctx.fillStyle = palette[8];
+  ctx.fillRect(140,80,40,60);
+  if (state.flags.ropePlaced) {
+    ctx.fillStyle = palette[6];
+    ctx.fillRect(158,90,4,80);
+  }
+}
+
+function drawTowerTop() {
+  ctx.fillStyle = palette[1];
+  ctx.fillRect(0,0,320,200);
+  ctx.fillStyle = palette[7];
+  ctx.fillRect(40,60,240,120);
+  ctx.fillStyle = palette[6];
+  ctx.fillRect(130,110,60,40);
+}
+
+function drawCellar() {
+  const lit = state.flags.lanternLit;
+  ctx.fillStyle = lit ? palette[8] : palette[0];
+  ctx.fillRect(0,0,320,200);
+  if (lit) {
+    ctx.fillStyle = palette[6];
+    ctx.fillRect(20,140,280,40);
+    ctx.fillStyle = palette[7];
+    ctx.fillRect(200,120,20,20);
+  }
+}
+
+function roomDescription() {
+  const r = state.room;
+  if (r === "gate") return state.flags.guardBribed ? "The gate stands open to the forest." : "A stern guard blocks the northern path.";
+  if (r === "market") return "Stalls crowd the square, most abandoned.";
+  if (r === "tavern") return "The tavern smells of smoke and ale.";
+  if (r === "alley") return "A narrow alley littered with crates.";
+  if (r === "forest") return "Pines whisper at the edge of the woods.";
+  if (r === "tower") return "An ancient tower rises here, with a trapdoor set in the floor.";
+  if (r === "towerTop") return "The wind howls; a locked chest rests here.";
+  if (r === "cellar") return state.flags.lanternLit ? "Dusty shelves line the cellar." : "It is pitch dark.";
+  return "";
+}
+
+function listVisibleItems() {
+  return Object.values(state.items).filter(i => i.location === state.room).map(i => i.name);
+}
+
+function showRoom() {
+  addLine(roomDescription());
+  const visible = listVisibleItems();
+  if (visible.length) addLine("You see: " + visible.join(", ") + ".");
+  const npcsHere = Object.values(npcs).filter(n => n.room === state.room).map(n => n.name);
+  if (npcsHere.length) addLine("Nearby: " + npcsHere.join(", ") + ".");
+}
+
+function tokenize(input) {
+  return input.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(Boolean);
+}
+
+function normalizeTokens(tokens) {
+  const synonyms = {
+    look: ["look", "l", "examine", "x"],
+    take: ["take", "get", "grab"],
+    inventory: ["inventory", "inv", "i"],
+    go: ["go", "walk", "move"],
+    talk: ["talk", "speak"],
+    give: ["give", "offer"],
+    use: ["use"],
+    light: ["light", "ignite"],
+    open: ["open"],
+    hint: ["hint"],
+    help: ["help"],
+    save: ["save"],
+    load: ["load"],
+    undo: ["undo"],
+    restart: ["restart"],
+    north: ["north", "n"],
+    south: ["south", "s"],
+    east: ["east", "e"],
+    west: ["west", "w"],
+    up: ["up", "u"],
+    down: ["down", "d"]
+  };
+  const map = {};
+  Object.keys(synonyms).forEach(key => synonyms[key].forEach(s => map[s] = key));
+  return tokens.map(t => map[t] || t);
+}
+
+function parseNounTarget(tokens) {
+  const preps = ["on", "to", "with", "at", "in", "into"];
+  let nounIndex = 0;
+  let noun = tokens[0];
+  if (preps.includes(noun)) {
+    nounIndex = 1;
+    noun = tokens[1];
+  }
+  let target = null;
+  for (let i = 1; i < tokens.length; i++) {
+    if (preps.includes(tokens[i])) {
+      target = tokens[i + 1];
+      break;
+    }
+  }
+  return { noun, target, nounIndex };
+}
+
+function findMatches(noun, scope) {
+  const results = [];
+  Object.values(state.items).forEach(item => {
+    if (!scope(item)) return;
+    if (item.aliases.includes(noun) || item.name === noun) results.push(item);
+  });
+  Object.values(npcs).forEach(npc => {
+    if (!scope(npc)) return;
+    if (npc.name === noun) results.push(npc);
+  });
+  return results;
+}
+
+function getSingleMatch(noun, scope, command) {
+  const matches = findMatches(noun, scope);
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    pendingDisambig = { matches, command };
+    addLine("Which do you mean: " + matches.map(m => m.name).join(", ") + "?");
+    return null;
+  }
+  return null;
+}
+
+function canMove(dir) {
+  if (state.room === "gate" && dir === "north" && !state.flags.guardBribed) return false;
+  if (state.room === "tower" && dir === "down" && !state.flags.ropePlaced) return false;
+  return !!rooms[state.room].exits[dir];
+}
+
+function move(dir) {
+  if (!canMove(dir)) {
+    addLine("You can't go that way.");
+    return;
+  }
+  state.room = rooms[state.room].exits[dir];
+  drawRoom();
+  showRoom();
+}
+
+function talk(npc) {
+  if (npc.name === "guard") {
+    addLine(state.flags.guardBribed ? "The guard nods, letting you pass." : "The guard grunts: 'Orders are orders. Nothing for free.'");
+  }
+  if (npc.name === "barkeep") {
+    if (state.items.lantern.location === "inventory") {
+      addLine("The barkeep says, 'That lantern should help you in the tower.'");
+    } else {
+      state.items.lantern.location = "inventory";
+      addLine("The barkeep slides you a lantern. 'You'll need this in the dark.'");
+    }
+  }
+  if (npc.name === "hermit") {
+    if (state.flags.locketReturned) {
+      addLine("The hermit smiles: 'May the woods shelter you, friend.'");
+    } else if (state.items.locket.location === "inventory") {
+      state.items.locket.location = "hidden";
+      state.flags.locketReturned = true;
+      addLine("The hermit clasps the locket. 'You have my thanks.'");
+    } else {
+      addLine("The hermit whispers: 'I lost a locket near the trees.'");
+    }
+  }
+}
+
+function take(item) {
+  if (!item.takeable) {
+    addLine("You can't take that.");
+    return;
+  }
+  if (item.location !== state.room) {
+    addLine("You don't see that here.");
+    return;
+  }
+  item.location = "inventory";
+  addLine("Taken.");
+}
+
+function useItem(item, target) {
+  let changed = false;
+  let responded = false;
+  if (item.name === "rope" && state.room === "tower") {
+    state.flags.ropePlaced = true;
+    addLine("You secure the rope to the trapdoor.");
+    changed = true;
+    responded = true;
+  }
+  if (item.name === "lantern") {
+    responded = true;
+    if (state.flags.lanternLit) addLine("The lantern is already lit.");
+    else {
+      state.flags.lanternLit = true;
+      addLine("You light the lantern.");
+      changed = true;
+    }
+  }
+  if (item.name === "key" && target && target.name === "chest") {
+    responded = true;
+    const opened = openChest();
+    if (opened) changed = true;
+  }
+  if (!responded) addLine("Nothing happens.");
+  return changed;
+}
+
+function openChest() {
+  if (state.room !== "towerTop") {
+    addLine("There is no chest here.");
+    return false;
+  }
+  if (state.flags.chestOpened) {
+    addLine("The chest is already open.");
+    return false;
+  }
+  if (state.items.key.location !== "inventory") {
+    addLine("The chest is locked.");
+    return false;
+  }
+  state.flags.chestOpened = true;
+  state.items.sunstone.location = "inventory";
+  addLine("You open the chest and claim the Sunstone! You win.");
+  return true;
+}
+
+function give(item, npc) {
+  if (item.location !== "inventory") {
+    addLine("You don't have that.");
+    return;
+  }
+  if (npc.name === "guard" && item.name === "coin") {
+    state.flags.guardBribed = true;
+    item.location = "hidden";
+    addLine("The guard pockets the coin and steps aside.");
+    return;
+  }
+  if (npc.name === "hermit" && item.name === "locket") {
+    item.location = "hidden";
+    state.flags.locketReturned = true;
+    addLine("The hermit accepts the locket, smiling.");
+    return;
+  }
+  addLine("That doesn't seem to help.");
+}
+
+function showInventory() {
+  const inv = Object.values(state.items).filter(i => i.location === "inventory").map(i => i.name);
+  addLine("You carry: " + (inv.length ? inv.join(", ") : "nothing") + ".");
+}
+
+function showHelp() {
+  addLine("Commands: LOOK, GO <dir>, TAKE <item>, TALK <npc>, GIVE <item> TO <npc>, USE <item>, LIGHT <item>, OPEN <thing>, INVENTORY, HINT, SAVE, LOAD, UNDO, RESTART.");
+}
+
+function showHint() {
+  for (const hint of hints) {
+    if (!hint.check(state)) {
+      const idx = state.hintIndex[hint.id] || 0;
+      const msg = hint.steps[Math.min(idx, hint.steps.length - 1)];
+      state.hintIndex[hint.id] = Math.min(idx + 1, hint.steps.length - 1);
+      addLine("Hint: " + msg);
+      return;
+    }
+  }
+  addLine("No hints right now.");
+}
+
+function saveGame() {
+  const data = cloneState(state);
+  data.history = [];
+  localStorage.setItem("sunstone-save", JSON.stringify(data));
+  addLine("Game saved.");
+}
+
+function loadGame() {
+  const raw = localStorage.getItem("sunstone-save");
+  if (!raw) { addLine("No saved game."); return; }
+  const loaded = JSON.parse(raw);
+  loaded.history = [];
+  restoreState(loaded);
+  addLine("Game loaded.");
+}
+
+function undo() {
+  if (!state.history.length) { addLine("Nothing to undo."); return; }
+  const prev = state.history.pop();
+  restoreState(prev);
+  addLine("Undone.");
+}
+
+function restart() {
+  state = newState();
+  transcriptEl.innerHTML = "";
+  addLine("The Sunstone of Eldermere");
+  showRoom();
+  drawRoom();
+  setStatus();
+}
+
+function executeCommand(verb, tokens) {
+  let stateChanged = false;
+
+  if (["north","south","east","west","up","down"].includes(verb)) {
+    saveHistory();
+    move(verb);
+    setStatus();
+    return;
+  }
+
+  if (verb === "go") {
+    const dir = tokens[0];
+    if (!dir) { addLine("Go where?"); return; }
+    if (!rooms[state.room].exits[dir] && !["north","south","east","west","up","down"].includes(dir)) { addLine("That's not a direction."); return; }
+    saveHistory();
+    move(dir);
+    setStatus();
+    return;
+  }
+
+  switch (verb) {
+    case "look":
+      if (tokens.length) {
+        const { noun, nounIndex } = parseNounTarget(tokens);
+        if (!noun) { addLine("Look at what?"); break; }
+        const target = getSingleMatch(noun, t => {
+          if (t.room) return t.room === state.room;
+          return t.location === state.room || t.location === "inventory";
+        }, { verb, tokens: [...tokens], index: nounIndex });
+        if (!target) {
+          if (pendingDisambig) return;
+          addLine("You don't see that here.");
+        } else {
+          addLine(target.desc || "You see nothing special.");
+        }
+      } else {
+        showRoom();
+      }
+      break;
+    case "inventory":
+      showInventory();
+      break;
+    case "take": {
+      const noun = tokens[0];
+      if (!noun) { addLine("Take what?"); break; }
+      const item = getSingleMatch(noun, i => i.location === state.room, { verb, tokens: [...tokens], index: 0 });
+      if (!item) {
+        if (pendingDisambig) return;
+        addLine("You don't see that.");
+        break;
+      }
+      saveHistory();
+      take(item);
+      stateChanged = true;
+      break;
+    }
+    case "talk": {
+      const noun = tokens[0];
+      if (!noun) { addLine("Talk to whom?"); break; }
+      const npc = getSingleMatch(noun, n => n.room === state.room, { verb, tokens: [...tokens], index: 0 });
+      if (!npc) {
+        if (pendingDisambig) return;
+        addLine("No one by that name here.");
+        break;
+      }
+      saveHistory();
+      talk(npc);
+      stateChanged = true;
+      break;
+    }
+    case "give": {
+      const noun = tokens[0];
+      const toIndex = tokens.indexOf("to");
+      const targetName = toIndex >= 0 ? tokens[toIndex + 1] : tokens[1];
+      if (!noun || !targetName) { addLine("Give what to whom?"); break; }
+      const item = getSingleMatch(noun, i => i.location === "inventory", { verb, tokens: [...tokens], index: 0 });
+      if (!item) {
+        if (pendingDisambig) return;
+        addLine("You don't have that.");
+        break;
+      }
+      const npcIndex = toIndex >= 0 ? toIndex + 1 : 1;
+      const npc = getSingleMatch(targetName, n => n.room === state.room, { verb, tokens: [...tokens], index: npcIndex });
+      if (!npc) {
+        if (pendingDisambig) return;
+        addLine("No one by that name here.");
+        break;
+      }
+      saveHistory();
+      give(item, npc);
+      stateChanged = true;
+      break;
+    }
+    case "use": {
+      const { noun, target, nounIndex } = parseNounTarget(tokens);
+      if (!noun) { addLine("Use what?"); break; }
+      const item = getSingleMatch(noun, i => i.location === "inventory", { verb, tokens: [...tokens], index: nounIndex });
+      if (!item) {
+        if (pendingDisambig) return;
+        addLine("You don't have that.");
+        break;
+      }
+      const before = cloneState(state);
+      const targetObj = target ? { name: target } : null;
+      const changed = useItem(item, targetObj);
+      if (changed) {
+        state.history.push(before);
+        stateChanged = true;
+      }
+      break;
+    }
+    case "light": {
+      const noun = tokens[0];
+      if (!noun) { addLine("Light what?"); break; }
+      const item = getSingleMatch(noun, i => i.location === "inventory", { verb, tokens: [...tokens], index: 0 });
+      if (!item) {
+        if (pendingDisambig) return;
+        addLine("That won't light.");
+        break;
+      }
+      if (item.name === "lantern") {
+        if (state.flags.lanternLit) {
+          addLine("The lantern is already lit.");
+        } else {
+          saveHistory();
+          state.flags.lanternLit = true;
+          addLine("You light the lantern.");
+          stateChanged = true;
+        }
+      } else {
+        addLine("That won't light.");
+      }
+      break;
+    }
+    case "open": {
+      const noun = tokens[0];
+      if (!noun) { addLine("Open what?"); break; }
+      if (noun === "chest") {
+        saveHistory();
+        const opened = openChest();
+        if (opened) {
+          stateChanged = true;
+        } else {
+          state.history.pop();
+        }
+      } else {
+        addLine("You can't open that.");
+      }
+      break;
+    }
+    case "hint":
+      showHint();
+      break;
+    case "help":
+      showHelp();
+      break;
+    case "save":
+      saveGame();
+      break;
+    case "load":
+      loadGame();
+      break;
+    case "undo":
+      undo();
+      break;
+    case "restart":
+      restart();
+      break;
+    default:
+      addLine("I don't understand that.");
+  }
+
+  if (stateChanged) {
+    if (state.room === "cellar" && state.flags.lanternLit && state.items.key.location === "hidden") {
+      state.items.key.location = "cellar";
+      addLine("In the lamplight, you spot a key.");
+    }
+    drawRoom();
+    setStatus();
+  }
+}
+
+function processCommand(input) {
+  if (!input.trim()) return;
+
+  if (pendingDisambig) {
+    addLine("> " + input);
+    const choice = input.trim().toLowerCase();
+    const match = pendingDisambig.matches.find(m => m.name === choice);
+    const command = pendingDisambig.command;
+    pendingDisambig = null;
+    if (match) {
+      command.tokens[command.index] = match.name;
+      executeCommand(command.verb, command.tokens);
+    } else {
+      addLine("I don't recognize that choice.");
+    }
+    return;
+  }
+
+  addLine("> " + input);
+  let tokens = normalizeTokens(tokenize(input));
+  const verb = tokens.shift() || "";
+  executeCommand(verb, tokens);
+}
+
+function start() {
+  state = newState();
+  addLine("The Sunstone of Eldermere");
+  showRoom();
+  drawRoom();
+  setStatus();
+}
+
+inputEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    const cmd = inputEl.value;
+    inputEl.value = "";
+    processCommand(cmd);
+  }
+});
+
+start();
+</script>
+</body>
+</html>
